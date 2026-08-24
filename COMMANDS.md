@@ -29,7 +29,7 @@ Series — группа однотипных рынков Kalshi (погода, 
 
 # build_series_manifest
 
-Фиксирует выборку series для дальнейшего скачивания markets/events. По умолчанию: `volume_fp >= 10,000`, исключение `short_recc`, группы `non_sport_crypto`, `sport`, `crypto`.
+Фиксирует выборку series для дальнейшего скачивания markets/events. По умолчанию: `volume_fp >= 10,000`, исключение `short_recc`, группы `non_sport_crypto` (main), `sport`, `crypto`.
 
 ```bash
 cd daily_export
@@ -172,3 +172,23 @@ Output:
 - `raw_payloads` — original batch JSON responses.
 
 The command uses the live batch candlestick endpoint and does not request historical candles. `--start-date` and `--end-date` can restrict the UTC date window. `--max-batches` is available for smoke tests.
+
+# notebooks
+
+The supervisor-facing workflow is split into two notebooks:
+
+1. `notebooks/daily_data_diagnostic.ipynb` reads SQLite, checks the selected candle run, and writes the prepared demo files;
+2. `notebooks/daily_data_eda.ipynb` reads only those files and contains no SQL or SQLite dependency.
+
+Run all cells in the diagnostic notebook first. It writes:
+
+```text
+data/demo/main_market_manifest.csv
+data/demo/main_market_metadata.csv
+data/demo/main_daily_candles.csv.gz
+data/demo/export_summary.json
+```
+
+`main_market_metadata.csv` is the one-row-per-market lookup keyed by `market_id`; join it to either the manifest or daily candles to recover the market question, descriptions, event context, series context, and rules.
+
+The diagnostic notebook automatically selects the latest `daily_candles` run for the configured `selection_id` and `non_sport_crypto` group. The exported summary preserves whether that source run was `success` or `partial`.

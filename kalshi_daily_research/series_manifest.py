@@ -20,8 +20,8 @@ DEFAULT_MIN_VOLUME = 10_000.0
 DEFAULT_EXCLUDED_FREQUENCY_GROUPS = ("short_recc",)
 DEFAULT_SPORT_CATEGORY = "Sports"
 DEFAULT_CRYPTO_CATEGORY = "Crypto"
-OTHER_GROUP = "non_sport_crypto"
-MANIFEST_GROUPS = (OTHER_GROUP, "sport", "crypto")
+MAIN_GROUP = "non_sport_crypto"
+MANIFEST_GROUPS = (MAIN_GROUP, "sport", "crypto")
 
 _MEMBER_COLUMNS = (
     "series_ticker",
@@ -110,7 +110,7 @@ def _member_for_payload(
     elif eligible and category_norm == crypto_category_norm:
         selection_group = "crypto"
     elif eligible:
-        selection_group = OTHER_GROUP
+        selection_group = MAIN_GROUP
     else:
         selection_group = None
 
@@ -224,7 +224,7 @@ def build_series_manifest(
         "category_groups": {
             "sport": [sport_category_norm],
             "crypto": [crypto_category_norm],
-            OTHER_GROUP: "all other categories",
+            MAIN_GROUP: "all other categories",
         },
     }
     rule_json = _json_text(rule)

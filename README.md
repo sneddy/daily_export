@@ -1,10 +1,8 @@
 # Kalshi Daily Research Dataset
 
-Design document for the new Kalshi daily-resolution research pipeline.
+This project builds a reproducible daily-resolution dataset for research on Kalshi prediction markets.
 
-This project is intentionally separate from the legacy Kalshi export, which produces 1-minute candles and a resampled 5-minute probability panel.
-
-Operational command history and dataset decisions are recorded in [`COMMANDS.md`](COMMANDS.md).
+Operational commands and decisions are recorded in [COMMANDS.md](COMMANDS.md).
 
 ## Purpose
 
@@ -12,156 +10,145 @@ Build a reproducible daily dataset that can support the following research quest
 
 > How informative and well-calibrated are prediction-market probabilities across different topics and levels of market activity?
 
-The first platform is Kalshi. The initial resolution is one day. The initial universe includes all technically valid binary markets with significant volume, across all available topics.
+The first platform is Kalshi. The first implementation uses native daily candles obtained through the live API endpoints. It does not require downloading all individual trades or constructing minute-level panels.
 
-The first research outputs are:
+The intended research outputs are:
 
 - Brier Score;
 - Log Loss;
 - reliability and calibration tables;
 - Brier decomposition where sample size permits;
 - results by topic, volume, liquidity, and time to resolution;
-- confidence intervals and complete sample/coverage diagnostics.
+- confidence intervals and complete sample and coverage diagnostics.
 
-## Design principles
+The current repository contains the data-extraction and daily-data demonstration layers. Outcome alignment and forecast evaluation are downstream research layers that are not yet finalized.
 
-1. Preserve source provenance and reproducibility.
-2. Use the platform's native daily candles instead of downloading all trades.
-3. Keep the raw market universe broader than the final analysis sample.
-4. Separate market eligibility from research cohorts and reporting filters.
-5. Never hide missing observations with untracked forward-filling.
-6. Keep the legacy 5-minute dataset unchanged.
-7. Keep the raw layer free of research-derived features.
-8. Make every release reconstructible from a source database, configuration, and run manifest.
+## Current first iteration
 
-## Target architecture
+The first iteration is intentionally narrow:
 
-```mermaid
+- Kalshi only;
+- live API endpoints only;
+- native daily candles with period_interval = 1440;
+- no raw trade-level download;
+- no historical endpoint;
+- no recurrent high-frequency panels;
+- three research groups:
+  - sport;
+  - crypto;
+  - non_sport_crypto (main).
+
+The live source mode refers to the API endpoint used for retrieval. It does not imply real-time streaming, and it does not guarantee a fixed six-month window. The actual date coverage is determined from the returned candle timestamps and is reported in the run metadata and exported summary.
+
+## Selection rules
+
+Selection happens at two different levels.
+
+### Series-level selection
+
+All series metadata is retained in raw_series. A frozen series manifest is then built using:
+
+- cumulative series volume_fp >= 10,000;
+- exclusion of the short_recc frequency group.
+
+The short_recc group is explicitly defined as:
+
+- weekly;
+- daily;
+- hourly;
+- fifteen_min.
+
+After eligibility is established, series are assigned to:
+
+- sport when the raw category is Sports;
+- crypto when the raw category is Crypto;
+- main for all remaining eligible categories.
+
+The selected series membership is stored in series_selection_runs and series_selection_members and exported to manifests/.
+
+### Market-level selection
+
+After event and market metadata is downloaded, the daily-candle planner applies a separate market-level filter.
+
+The current default is the union of:
+
+- cumulative market volume_fp >= 10,000;
+- market lifetime >= 5 days.
+
+A market enters the daily-candle download if it passes at least one of these filters. The manifest retains the individual volume, lifetime, and intersection flags so the cohorts can be compared later without downloading candles again.
+
+## Current architecture
+
+~~~mermaid
 flowchart LR
-    A[Kalshi API] --> B[Raw series, events, and markets]
-    B --> C[Market universe]
-    C --> D[Topic taxonomy and eligibility]
-    D --> E[Selected markets]
-    E --> F[Daily history planner]
-    F --> G[Live daily candles]
-    F --> H[Historical daily candles]
-    G --> I[Normalized daily candles]
-    H --> I
-    I --> J[Quality and coverage checks]
-    J --> K[(Daily SQLite dataset)]
-    K --> L[Canonical Parquet snapshot]
-    L --> M[As-of forecast snapshots]
-    M --> N[Evidence report]
-    N --> O[Brier, Log Loss, calibration, and topic analysis]
-```
+    A[Kalshi live API] --> B[Raw series metadata]
+    B --> C[Frozen series manifest]
+    C --> D[Sport / Crypto / Main]
+    D --> E[Event and market metadata]
+    E --> F[Market history manifest]
+    F --> G[Market-level filters]
+    G --> H[Native daily candles]
+    H --> I[(Raw SQLite database)]
+    I --> J[Diagnostic export]
+    J --> K[CSV demo snapshot]
+    K --> L[CSV-only EDA notebook]
+    L --> M[Future outcome and calibration research]
+~~~
 
-## Scope of the first version
-
-### Included
-
-- Kalshi series, event, and market metadata;
-- all available categories unless a market fails a technical validity check;
-- binary markets;
-- significant-volume markets, initially using a configurable volume floor;
-- live and historical daily candles;
-- resolved outcomes and settlement metadata;
-- daily close probability as the primary forecast;
-- volume, open interest, spread-related fields, and candle quality flags;
-- reproducible canonical releases and research reports.
-
-### Excluded from the first version
-
-- raw trades as the primary history source;
-- 1-minute and 5-minute history;
-- complex repricing and decisiveness benchmarks;
-- aggressive title-based topic exclusion;
-- Polymarket integration;
-- external covariates and survey data integration.
-
-These may be added later without changing the daily source contract.
-
-## Separation from the legacy pipeline
-
-The current legacy database remains the source for existing 5-minute artifacts:
-
-```text
-db/kalshi_probability_dataset.sqlite
-```
-
-The new pipeline should use a separate database and output namespace:
-
-```text
-db/kalshi_daily_probability_dataset.sqlite
-frozen_notebooks/running_artefacts/kalshi_daily/
-benchmark_releases/kalshi_daily/
-```
-
-Daily and 5-minute rows must not share a table whose key is only `(market_id, timestamp_utc)`. If the datasets are unified in the future, the key must include an explicit frequency or resolution field.
+The pipeline does not resample trades. It requests Kalshi's native daily candle representation in batches and preserves source fields and provenance.
 
 ## Data layers
 
 ### 1. Raw metadata
 
-Retain the existing series-first structure:
+The raw metadata layer contains:
 
-```text
+~~~text
 raw_series
-raw_markets
 raw_events
-market_universe
-```
-
-The new raw metadata database also contains:
-
-```text
+raw_markets
 metadata_runs
 raw_payloads
-```
+~~~
 
-Stable identifiers:
+raw_series stores the full series snapshot. Events and markets are downloaded only for series selected by the frozen manifest.
 
-```text
+The normalized tables provide queryable fields, while raw_payloads retains original API responses for recoverability.
+
+Stable identifiers are:
+
+~~~text
 market_id = kalshi:{ticker}
 event_id  = kalshi:event:{event_ticker}
-```
+~~~
 
-`market_universe` should retain markets that do not enter the research sample. This is needed to measure selection bias and topic coverage.
+### 2. Frozen selection
 
-### 2. Selection and taxonomy
+The selection layer contains:
 
-Selection should be split into separate concepts:
+~~~text
+series_selection_runs
+series_selection_members
+manifests/series_selection_<selection_id>.csv
+~~~
 
-```text
-technical_validity
-market_eligibility
-analysis_cohort
-reporting_slice
-```
+This layer records the source series run, selection rules, frequency group, volume, eligibility, exclusion reason, and research group.
 
-The initial eligibility rule should be close to:
+### 3. Raw daily history
 
-```text
-market_type == binary
-AND ticker is present
-AND outcome is interpretable
-AND timing fields are valid
-AND volume_num >= configured_volume_floor
-```
+The daily history layer contains:
 
-The category should not be an allowlist. All categories should pass into the universe, with the platform category and a research taxonomy stored explicitly.
+~~~text
+raw_daily_candles
+market_history_manifest
+~~~
 
-The volume floor is an operational starting point, not the only scientific sample definition. Every release should also retain volume and liquidity tiers for robustness analysis.
+raw_daily_candles is a thin, source-preserving representation of native daily candles. Important fields include:
 
-### 3. Raw daily candles
-
-The authoritative history table should be a thin, source-preserving table named `raw_daily_candles`. Its fields should be direct values from the Kalshi candle response, with only one-to-one naming and type normalization.
-
-The minimal parsed schema should contain:
-
-```text
+~~~text
 market_id
 market_ticker
-timestamp_utc
+series_ticker
 end_period_ts
 period_interval
 source_mode
@@ -173,14 +160,8 @@ price_mean
 price_previous
 price_min
 price_max
-yes_bid_open
-yes_bid_low
-yes_bid_high
-yes_bid_close
-yes_ask_open
-yes_ask_low
-yes_ask_high
-yes_ask_close
+yes_bid_*
+yes_ask_*
 volume
 open_interest
 request_start_ts
@@ -188,159 +169,107 @@ request_end_ts
 retrieved_at_utc
 run_id
 raw_payload_json
-```
+~~~
 
-`timestamp_utc` and the normalized column names are convenience mappings. They must not change the meaning of the source fields.
+market_history_manifest stores the extraction decision and coverage information for each market:
 
-`raw_payload_json` is retained so that fields added by Kalshi later are not lost before the schema is updated.
-
-The raw layer must not contain:
-
-- returns or price changes;
-- volatility, range, entropy, or momentum;
-- spreads calculated from bid/ask;
-- volume or liquidity tiers;
-- staleness or missingness indicators;
-- forward-filled observations;
-- category aggregates;
-- Brier Score, Log Loss, or calibration outputs.
-
-The primary research probability is defined downstream as:
-
-```text
-p_t = price_close
-```
-
-There should be no `trade_count` field unless Kalshi actually returns it. `volume` must not silently be relabeled as trade count or total trade size. Synthetic continuity candles, if requested, should be identified from request/response provenance in a downstream audit table rather than mixed into derived research features.
-
-The raw response landing layer may additionally store one immutable JSON response per request. The parsed `raw_daily_candles` table is for efficient access; the landing payload is for maximum recoverability.
-
-The same principle applies to metadata: `raw_payloads` retains the source JSON for every entity seen in a run, while the `raw_series`, `raw_events`, and `raw_markets` tables provide queryable current rows.
-
-## Raw metadata implementation
-
-The implementation lives in `kalshi_daily_research/` and does not modify the legacy `kalshi_export/` package. Run the commands below from the `daily_export/` project root.
-
-Before market pagination, the pipeline requests series metadata with `include_volume=true`. It retains every series in `raw_series`, but only queries market endpoints for series whose lifetime `volume_fp` is at least the configured `--min-series-volume` threshold. The default is `20,000` contracts, matching the initial market-level volume threshold used by the legacy Kalshi pipeline. A missing series volume is retained conservatively.
-
-Smoke run:
-
-```bash
-python -m kalshi_daily_research.scripts.ingest_raw_metadata \
-  --db-path db/kalshi_daily_probability_dataset.sqlite \
-  --max-pages 1 \
-  --source-mode live
-```
-
-Full metadata backfill:
-
-```bash
-python -m kalshi_daily_research.scripts.ingest_raw_metadata \
-  --db-path db/kalshi_daily_probability_dataset.sqlite \
-  --source-mode both
-```
-
-Completed markets from one UTC month only:
-
-```bash
-python -m kalshi_daily_research.scripts.ingest_raw_metadata \
-  --db-path db/kalshi_daily_probability_dataset.sqlite \
-  --source-mode live \
-  --completed-month 2026-08
-```
-
-“Completed” means that the source `settlement_ts` falls in the half-open interval `[2026-08-01T00:00:00Z, 2026-09-01T00:00:00Z)`. It does not mean merely closed.
-
-For live markets, the command passes `status=settled`, the settlement timestamp bounds, `series_ticker`, and `mve_filter=exclude` to the API. Historical markets are queried per selected series; date filtering and multivariate-market filtering are applied locally where the endpoint does not provide equivalent filters. The progress bar shows filtered rows as `filtered`.
-
-For the current month, use `--source-mode live` when the month is newer than Kalshi's historical cutoff. Use `--min-series-volume` to adjust the series prefilter without changing the code.
-
-Example with a stricter series prefilter:
-
-```bash
-python -m kalshi_daily_research.scripts.ingest_raw_metadata \
-  --db-path db/kalshi_daily_probability_dataset.sqlite \
-  --source-mode live \
-  --completed-month 2026-08 \
-  --min-series-volume 50000
-```
-
-The command is idempotent for the current normalized tables and keeps raw response payloads associated with each `run_id`.
-
-By default the command displays progress bars for each metadata stage. Use `--no-progress` for cron or log-only execution.
-
-### 4. History manifest
-
-The existing `added_markets` idea should evolve into a daily history manifest with one current operational status row per market and a run-level manifest. This is metadata about extraction, not part of the raw candle values.
-
-Per-market fields should include:
-
-```text
-market_id
-history_start_utc
-history_end_utc
-first_observation_utc
-last_observation_utc
+~~~text
+selection_id
+selection_group
+filter_mode
+passes_volume_filter
+passes_lifetime_filter
+passes_both_filters
+volume_fp
+lifetime_days
+history_start_ts
+history_end_ts
 expected_daily_rows
 received_daily_rows
-missing_daily_rows
-last_successful_end_utc
-last_source_mode
-coverage_ok
-quality_ok
-download_warnings_json
+status
+error_text
 run_id
-```
+~~~
 
-The run manifest should record configuration, API source, cutoff timestamp, request counts, retries, failures, batch sizes, and output hashes.
+The raw layer does not contain research-derived features such as returns, volatility, spreads, momentum, volume tiers, forward-filled values, category aggregates, Brier Score, or calibration outputs.
 
-## Ingestion strategy
+The primary probability used for the first downstream analysis is expected to be price_close, but the final forecast-timestamp convention remains a research decision.
 
-### Initial backfill
+### 4. Prepared demo snapshot
 
-1. Download broad series and market metadata.
-2. Enrich event/category information.
-3. Build the complete eligible market queue.
-4. Fetch native daily candles.
-5. Normalize and validate rows.
-6. Upsert daily candles and manifests.
+The diagnostic notebook creates a lightweight presentation snapshot under data/demo/:
 
-### Incremental refresh
+~~~text
+data/demo/
+├── main_market_manifest.csv
+├── main_market_metadata.csv
+├── main_daily_candles.csv.gz
+└── export_summary.json
+~~~
 
-For active markets, request only new daily intervals. Re-fetch a small recent window to account for late updates. For newly settled markets, run a settlement repair window and then route stable history through the historical endpoint.
+The market manifest has one row per selected market. The market metadata file is a one-row-per-market lookup keyed by `market_id`; it contains the market question, descriptions, event context, series context, and rules. The daily-candle file contains market-by-day observations needed for the demonstration notebook. The full source payloads remain in SQLite.
 
-The planner should be gap-aware: a market with missing historical days is not complete merely because it has at least one candle.
+## Notebook workflow
 
-### Batching
+The notebooks are intentionally separated into preparation and presentation layers.
 
-Use the batch candles endpoint where supported. Respect both the maximum number of market tickers and the maximum total number of returned candles. Historical requests should not assume a batch endpoint exists; use bounded concurrency and rate-limit protection instead.
+The purpose, execution order, and current key insights for every notebook are documented in [notebooks/README.md](notebooks/README.md).
 
-## Quality checks
+### Diagnostic notebook
 
-Every run should report:
+notebooks/daily_data_diagnostic.ipynb:
 
-- duplicate `(market_id, timestamp_utc)` rows;
-- invalid UTC timestamps;
-- probabilities outside `[0, 1]`;
-- invalid OHLC ordering;
-- negative volume or open interest;
-- observations outside market lifetime;
-- observations after settlement;
-- synthetic rows;
-- missing daily intervals;
-- stale latest observation;
-- fallback-source usage;
-- coverage by category and volume tier.
+- reads SQLite;
+- selects a frozen daily-candle run;
+- extracts the market manifest, market metadata lookup, and daily candles;
+- checks duplicates, intervals, probabilities, missingness, and coverage;
+- preserves the source run status;
+- writes data/demo/ files.
 
-Quality checks should produce flags and diagnostics, not silently discard data.
+This is the only notebook in the demo workflow that uses SQL.
 
-Quality results should be stored in a separate audit table or report. They must not overwrite or enrich the raw candle rows.
+### EDA demonstration notebook
+
+notebooks/daily_data_eda.ipynb:
+
+- reads only the prepared CSV and JSON files;
+- contains no SQL queries;
+- does not depend on SQLite;
+- joins question and description fields by `market_id`;
+- shows the selected universe, filters, date coverage, sample probability paths, and basic data quality.
+
+This notebook is intended to be easy to share with a supervisor and to demonstrate what the daily export contains before outcome-based evaluation is added.
+
+## Operational workflow
+
+Run the stages in this order:
+
+1. Download all series metadata.
+2. Build the frozen series manifest.
+3. Download event and market metadata separately for sport, crypto, and main.
+4. Download native daily candles for each group.
+5. Run daily_data_diagnostic.ipynb to create the demo snapshot.
+6. Run daily_data_eda.ipynb for visualization and inspection.
+
+The exact commands and current selection ID are maintained in [COMMANDS.md](COMMANDS.md).
+
+## Design principles
+
+1. Preserve source provenance and reproducibility.
+2. Use native daily candles instead of downloading all trades.
+3. Keep raw source fields separate from research-derived features.
+4. Separate series eligibility, market filtering, research cohorts, and reporting slices.
+5. Never hide missing observations with untracked forward-filling.
+6. Keep the legacy 5-minute pipeline unchanged.
+7. Preserve raw API payloads so that schema changes do not destroy information.
+8. Make each snapshot reconstructible from a database, configuration, run ID, and manifest.
+9. Make partial retrieval status visible rather than presenting incomplete coverage as complete.
 
 ## Research contract
 
-Each evaluation row represents a probability forecast for one resolved binary market:
+The planned downstream evaluation table will represent one probability forecast for one resolved binary market:
 
-```text
+~~~text
 market_id
 event_id
 forecast_timestamp_utc
@@ -353,53 +282,77 @@ volume_tier
 liquidity_tier
 days_to_resolution
 observation_age_days
-```
+~~~
 
-The as-of rule must be explicit. For a cutoff, use the latest valid daily close at or before that cutoff and retain the age of the observation. Do not silently use information after the cutoff.
+The as-of rule must be explicit. For a forecast cutoff, the analysis should use the latest valid daily close at or before that cutoff and retain the age of the observation. Information after the cutoff must not be used.
 
-The first planned horizons are configurable but should include a small set such as:
-
-```text
-1, 7, 14, and 30 days before resolution
-```
-
-Primary metrics:
+Planned metrics include:
 
 - Brier Score;
 - Log Loss;
-- calibration/reliability;
+- calibration and reliability;
 - Brier decomposition;
 - base-rate comparison;
 - stratified results by topic, volume, liquidity, and horizon.
 
-Uncertainty should be estimated with market- or event-level resampling so repeated markets from the same event or series do not appear independent.
+Uncertainty should be estimated with market- or event-level resampling so that repeated markets from the same event or series are not treated as fully independent observations.
+
+## Future extensions
+
+The following are intentionally deferred:
+
+- historical Kalshi endpoints;
+- incremental daily refresh;
+- gap repair and settlement repair;
+- higher-frequency robustness panels;
+- canonical Parquet releases;
+- as-of forecast snapshots;
+- external survey, macroeconomic, or other covariate integration;
+- complex repricing and decisiveness benchmarks;
+- Polymarket integration.
+
+These extensions should be added without changing the raw daily source contract.
 
 ## Project layout
 
-```text
+~~~text
 daily_export/
 ├── README.md
+├── COMMANDS.md
 ├── pyproject.toml
 ├── requirements.txt
 ├── kalshi_daily_research/
 │   ├── client.py
 │   ├── ingest.py
 │   ├── schema.py
+│   ├── candles.py
+│   ├── series_selection.py
+│   ├── series_manifest.py
 │   ├── scripts/
 │   └── tests/
-└── db/                         # generated locally; ignored by git
-```
+├── manifests/
+├── notebooks/
+│   ├── analyze_metadata.ipynb
+│   ├── daily_data_diagnostic.ipynb
+│   ├── daily_data_eda.ipynb
+│   └── explore_series.ipynb
+├── data/
+│   └── demo/
+└── db/
+~~~
 
-The daily project has its own package, database namespace, dependencies, and entry point. It must not alter the legacy export behavior.
+The daily project uses its own package and database namespace. It does not modify the legacy Kalshi export or its existing 5-minute artifacts.
 
-## Definition of done for v1
+## First-iteration completion criteria
 
-- all eligible Kalshi categories are represented;
-- the market selection rule is versioned and auditable;
-- daily candles are stored without requiring raw trades;
-- live and historical source provenance is available;
-- incremental refresh and gap repair are defined;
-- daily completeness is source-aware;
-- canonical Parquet output can be rebuilt from SQLite and a manifest;
-- as-of forecast rows can be generated without look-ahead;
-- Brier, Log Loss, calibration, and category/volume breakdowns are reproducible.
+The first iteration is considered operationally complete when:
+
+- the series selection rule is frozen and auditable;
+- sport, crypto, and main groups can be downloaded separately;
+- event and market metadata are available for the selected groups;
+- native daily candles are stored with source provenance;
+- market-level volume and lifetime decisions are recorded;
+- partial retrieval and coverage diagnostics are visible;
+- the diagnostic notebook can rebuild the demo CSV snapshot;
+- the EDA notebook can run without SQL or SQLite;
+- the resulting snapshot can support the next outcome-alignment and Brier Score stage.

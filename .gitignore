@@ -1,5 +1,6 @@
 /db/
 /logs/
+/data/demo/main_daily_candles.csv
 *.db
 *.sqlite
 *.sqlite3
