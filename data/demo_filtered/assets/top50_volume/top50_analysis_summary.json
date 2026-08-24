@@ -1,7 +1,6 @@
 {
   "sample": "50 highest-volume resolved binary markets",
   "primary_probability_field": "price_mean",
-  "sensitivity_probability_field": "price_close",
   "forecast_horizons_days": [
     1,
     3,
