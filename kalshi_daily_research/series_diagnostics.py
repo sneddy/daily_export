@@ -191,6 +191,25 @@ def plot_group_counts(data: pd.DataFrame, title: str = "Series by operational gr
     return fig
 
 
+def plot_group_volume_totals(data: pd.DataFrame, title: str = "Total volume by operational group"):
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import StrMethodFormatter
+
+    totals = (
+        data.groupby("frequency_group")["volume_fp"]
+        .sum()
+        .reindex(GROUP_ORDER, fill_value=0)
+    )
+    fig, ax = plt.subplots(figsize=(7, 4))
+    bars = ax.bar(totals.index, totals, color=[GROUP_COLORS[x] for x in GROUP_ORDER])
+    ax.bar_label(bars, labels=[f"{value:,.0f}" for value in totals], padding=3, fontsize=9)
+    ax.set_title(title)
+    ax.set_ylabel("Total volume (USD)")
+    ax.yaxis.set_major_formatter(StrMethodFormatter("${x:,.0f}"))
+    fig.tight_layout()
+    return fig
+
+
 def plot_group_volume(data: pd.DataFrame, title: str = "Volume by operational group"):
     import matplotlib.pyplot as plt
 
@@ -219,3 +238,26 @@ def plot_category_counts(data: pd.DataFrame, top_n: int = 20, title: str = "Top 
     fig.tight_layout()
     return fig
 
+
+def plot_category_volume_totals(
+    data: pd.DataFrame,
+    top_n: int = 20,
+    title: str = "Top categories by total volume",
+):
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import StrMethodFormatter
+
+    totals = (
+        data.groupby("category")["volume_fp"]
+        .sum()
+        .nlargest(top_n)
+        .sort_values()
+    )
+    fig, ax = plt.subplots(figsize=(9, 6))
+    bars = ax.barh(totals.index, totals, color="#76B7B2")
+    ax.bar_label(bars, labels=[f"{value:,.0f}" for value in totals], padding=3, fontsize=8)
+    ax.set_title(title)
+    ax.set_xlabel("Total volume (USD)")
+    ax.xaxis.set_major_formatter(StrMethodFormatter("${x:,.0f}"))
+    fig.tight_layout()
+    return fig
