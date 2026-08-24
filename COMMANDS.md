@@ -102,7 +102,7 @@ Args:
 
 # download_daily_candles
 
-Скачивает native daily candles (`period_interval=1440`) для market universe, отфильтрованного по cumulative `volume_fp` и lifetime market. Один market скачивается только один раз; принадлежность к каждому фильтру сохраняется в `market_history_manifest`.
+Скачивает native daily candles с 1440-минутным интервалом для market universe, отфильтрованного по cumulative `volume_fp` и lifetime market. Внутри одного run market запрашивается только один раз; принадлежность к каждому фильтру сохраняется в `market_history_manifest`. Для повторной попытки используется отдельный retry run.
 
 Основной запуск для `non_sport_crypto`:
 
@@ -173,6 +173,22 @@ Output:
 
 The command uses the live batch candlestick endpoint and does not request historical candles. `--start-date` and `--end-date` can restrict the UTC date window. `--max-batches` is available for smoke tests.
 
+To retry unresolved markets that have a historical `api_error` for the same selection and group:
+
+```bash
+python -m kalshi_daily_research.scripts.download_daily_candles \
+  --db-path db/kalshi_daily_probability_dataset.sqlite \
+  --selection-id 20260817T124811Z-3b15c8a0-637b555156e3 \
+  --group non_sport_crypto \
+  --filter-mode union \
+  --min-volume-fp 10000 \
+  --min-lifetime-days 5 \
+  --max-tickers-per-batch 20 \
+  --retry-status api_error
+```
+
+The retry mode searches the full manifest history, excludes markets resolved by a later `success` or `empty` status, copies the latest full market manifest as its baseline, and uses the requested `--max-tickers-per-batch` value. Use `--max-tickers-per-batch 1` to isolate individual failures. The new run keeps `retry_parent_run_id` in its provenance; rerun the diagnostic notebook afterwards so the exported candles combine the parent and retry run history.
+
 # notebooks
 
 The supervisor-facing workflow is split into two notebooks:
@@ -183,12 +199,12 @@ The supervisor-facing workflow is split into two notebooks:
 Run all cells in the diagnostic notebook first. It writes:
 
 ```text
-data/demo/main_market_manifest.csv
 data/demo/main_market_metadata.csv
 data/demo/main_daily_candles.csv.gz
 data/demo/export_summary.json
 ```
 
-`main_market_metadata.csv` is the one-row-per-market lookup keyed by `market_id`; join it to either the manifest or daily candles to recover the market question, descriptions, event context, series context, and rules.
+`main_market_metadata.csv` is the one-row-per-market lookup keyed by `market_id`; it contains the question, descriptions, dates, selection filters, and candle coverage. Join it to `main_daily_candles.csv.gz` by `market_id`.
 
 The diagnostic notebook automatically selects the latest `daily_candles` run for the configured `selection_id` and `non_sport_crypto` group. The exported summary preserves whether that source run was `success` or `partial`.
+

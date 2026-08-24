@@ -47,6 +47,12 @@ class FakeCandleClient:
         }
 
 
+class FailingCandleClient(FakeCandleClient):
+    def get_batch_market_candlesticks(self, **params):
+        self.calls.append(params)
+        raise RuntimeError("HTTPError('400 Client Error: Bad Request')")
+
+
 def _seed_database(conn: sqlite3.Connection) -> None:
     ensure_schema(conn)
     conn.executemany(
@@ -157,3 +163,102 @@ def test_both_filter_mode_downloads_only_intersection() -> None:
 
     assert result["candidate_markets"] == 1
     assert client.calls[0]["market_tickers"] == ["MARKET-BOTH"]
+
+
+def test_retry_status_uses_latest_run_and_isolates_tickers() -> None:
+    conn = sqlite3.connect(":memory:")
+    _seed_database(conn)
+
+    failed_client = FailingCandleClient()
+    failed_result = DailyCandleIngestor(conn, failed_client).run(
+        DailyCandleRunConfig(
+            selection_id=SELECTION_ID,
+            selection_group="non_sport_crypto",
+            filter_mode="union",
+            show_progress=False,
+        )
+    )
+
+    parent_run_id = failed_result["run_id"]
+    assert failed_result["api_errors"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM market_history_manifest WHERE run_id=? AND status='api_error'",
+        (parent_run_id,),
+    ).fetchone()[0] == 3
+
+    retry_client = FakeCandleClient()
+    retry_result = DailyCandleIngestor(conn, retry_client).run(
+        DailyCandleRunConfig(
+            selection_id=SELECTION_ID,
+            selection_group="non_sport_crypto",
+            filter_mode="union",
+            retry_status="api_error",
+            max_tickers_per_batch=1,
+            show_progress=False,
+        )
+    )
+
+    assert retry_result["retry_parent_run_id"] == parent_run_id
+    assert retry_result["candidate_markets"] == 3
+    assert retry_result["api_errors"] == 0
+    assert len(retry_client.calls) == 3
+    assert all(len(call["market_tickers"]) == 1 for call in retry_client.calls)
+
+    retry_run_id = retry_result["run_id"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM market_history_manifest WHERE run_id=?",
+        (retry_run_id,),
+    ).fetchone()[0] == 3
+    assert conn.execute(
+        "SELECT COUNT(*) FROM market_history_manifest WHERE run_id=? AND status='success'",
+        (retry_run_id,),
+    ).fetchone()[0] == 3
+    config_json = conn.execute(
+        "SELECT config_json FROM metadata_runs WHERE run_id=?",
+        (retry_run_id,),
+    ).fetchone()[0]
+    assert json.loads(config_json)["retry_parent_run_id"] == parent_run_id
+
+
+def test_retry_status_continues_from_unprocessed_rows_in_latest_retry_run() -> None:
+    conn = sqlite3.connect(":memory:")
+    _seed_database(conn)
+
+    failed_client = FailingCandleClient()
+    DailyCandleIngestor(conn, failed_client).run(
+        DailyCandleRunConfig(
+            selection_id=SELECTION_ID,
+            selection_group="non_sport_crypto",
+            filter_mode="union",
+            show_progress=False,
+        )
+    )
+
+    partial_retry = DailyCandleIngestor(conn, FakeCandleClient()).run(
+        DailyCandleRunConfig(
+            selection_id=SELECTION_ID,
+            selection_group="non_sport_crypto",
+            filter_mode="union",
+            retry_status="api_error",
+            max_tickers_per_batch=1,
+            max_batches=1,
+            show_progress=False,
+        )
+    )
+    assert partial_retry["candidate_markets"] == 3
+
+    resumed_client = FakeCandleClient()
+    resumed = DailyCandleIngestor(conn, resumed_client).run(
+        DailyCandleRunConfig(
+            selection_id=SELECTION_ID,
+            selection_group="non_sport_crypto",
+            filter_mode="union",
+            retry_status="api_error",
+            max_tickers_per_batch=1,
+            show_progress=False,
+        )
+    )
+
+    assert resumed["candidate_markets"] == 2
+    assert len(resumed_client.calls) == 2
+    assert all(len(call["market_tickers"]) == 1 for call in resumed_client.calls)

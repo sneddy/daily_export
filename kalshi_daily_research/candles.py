@@ -22,6 +22,7 @@ from .schema import ensure_schema
 
 
 FILTER_MODES = frozenset({"volume", "lifetime", "both", "union"})
+RETRY_STATUSES = frozenset({"api_error"})
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class DailyCandleRunConfig:
     max_candles_per_batch: int = 10_000
     max_batches: int | None = None
     include_latest_before_start: bool = False
+    retry_status: str | None = None
     show_progress: bool = True
 
 
@@ -124,7 +126,112 @@ class DailyCandleIngestor:
         self.client = client
         ensure_schema(conn)
 
-    def _load_candidates(self, config: DailyCandleRunConfig) -> list[dict[str, Any]]:
+    def _latest_daily_candle_run_id(self, config: DailyCandleRunConfig) -> str:
+        row = self.conn.execute(
+            """
+            SELECT run_id
+            FROM metadata_runs
+            WHERE json_extract(config_json, '$.stage') = 'daily_candles'
+              AND json_extract(config_json, '$.selection_id') = ?
+              AND json_extract(config_json, '$.selection_group') = ?
+            ORDER BY started_at_utc DESC, rowid DESC
+            LIMIT 1
+            """,
+            (config.selection_id, config.selection_group),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                "No previous daily-candle run exists for the selected selection and group."
+            )
+        return str(row[0])
+
+    def _load_retry_candidates(
+        self,
+        config: DailyCandleRunConfig,
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            WITH ranked_manifest AS (
+                SELECT
+                    mh.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY mh.market_id
+                        ORDER BY mr.started_at_utc DESC, mr.rowid DESC, mh.run_id DESC
+                    ) AS latest_row,
+                    MAX(CASE WHEN mh.status = 'api_error' THEN 1 ELSE 0 END)
+                        OVER (PARTITION BY mh.market_id) AS had_api_error
+                FROM market_history_manifest mh
+                JOIN metadata_runs mr ON mr.run_id = mh.run_id
+                WHERE mh.selection_id = ?
+                  AND mh.selection_group = ?
+            )
+            SELECT
+                market_id,
+                market_ticker,
+                event_ticker,
+                series_ticker,
+                selection_id,
+                selection_group,
+                filter_mode,
+                passes_volume_filter,
+                passes_lifetime_filter,
+                passes_both_filters,
+                volume_fp,
+                lifetime_days,
+                history_start_ts,
+                history_end_ts,
+                expected_daily_rows
+            FROM ranked_manifest
+            WHERE latest_row = 1
+              AND had_api_error = 1
+              AND status IN ('api_error', 'queued')
+            ORDER BY market_ticker
+            """,
+            (
+                config.selection_id,
+                config.selection_group,
+            ),
+        ).fetchall()
+
+        return [
+            {
+                "market_id": row[0],
+                "market_ticker": row[1],
+                "event_ticker": row[2],
+                "series_ticker": row[3],
+                "selection_id": row[4],
+                "selection_group": row[5],
+                "filter_mode": row[6],
+                "passes_volume_filter": row[7],
+                "passes_lifetime_filter": row[8],
+                "passes_both_filters": row[9],
+                "volume_fp": row[10],
+                "lifetime_days": row[11],
+                "history_start_ts": row[12],
+                "history_end_ts": row[13],
+                "expected_daily_rows": row[14],
+                "status": "queued",
+            }
+            for row in rows
+        ]
+
+    def _load_candidates(
+        self,
+        config: DailyCandleRunConfig,
+        *,
+        retry_parent_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if config.retry_status is not None:
+            if retry_parent_run_id is None:
+                raise ValueError("retry_parent_run_id is required for retry candidates")
+            candidates = self._load_retry_candidates(config)
+            if not candidates:
+                raise ValueError(
+                    f"No unresolved markets with historical status {config.retry_status!r} found "
+                    "for the selected selection and group."
+                )
+            return candidates
+
         rows = self.conn.execute(
             """
             SELECT
@@ -217,12 +324,13 @@ class DailyCandleIngestor:
     def _batches(candidates: list[dict[str, Any]], config: DailyCandleRunConfig) -> Iterable[list[dict[str, Any]]]:
         batch: list[dict[str, Any]] = []
         estimated_rows = 0
+        max_tickers_per_batch = config.max_tickers_per_batch
         for candidate in candidates:
             if candidate["expected_daily_rows"] <= 0:
                 continue
             expected = candidate["expected_daily_rows"]
             would_exceed = batch and (
-                len(batch) >= config.max_tickers_per_batch
+                len(batch) >= max_tickers_per_batch
                 or estimated_rows + expected > config.max_candles_per_batch
             )
             if would_exceed:
@@ -234,12 +342,21 @@ class DailyCandleIngestor:
         if batch:
             yield batch
 
-    def _insert_run(self, run_id: str, started_at: str, config: DailyCandleRunConfig) -> None:
+    def _insert_run(
+        self,
+        run_id: str,
+        started_at: str,
+        config: DailyCandleRunConfig,
+        *,
+        retry_parent_run_id: str | None = None,
+    ) -> None:
         run_config = {
             "stage": "daily_candles",
             "selection_id": config.selection_id,
             "selection_group": config.selection_group,
             "filter_mode": config.filter_mode,
+            "retry_status": config.retry_status,
+            "retry_parent_run_id": retry_parent_run_id,
             "config": asdict(config),
         }
         self.conn.execute(
@@ -249,6 +366,44 @@ class DailyCandleIngestor:
             VALUES (?, ?, 'running', ?, 'live', ?)
             """,
             (run_id, started_at, getattr(self.client, "base_url", ""), _json_text(run_config)),
+        )
+
+    def _copy_manifest_rows(self, run_id: str, parent_run_id: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO market_history_manifest (
+                run_id, market_id, market_ticker, event_ticker, series_ticker,
+                selection_id, selection_group, filter_mode,
+                passes_volume_filter, passes_lifetime_filter, passes_both_filters,
+                volume_fp, lifetime_days, history_start_ts, history_end_ts,
+                expected_daily_rows, received_daily_rows, first_observation_ts,
+                last_observation_ts, status, error_text
+            )
+            SELECT
+                ?, market_id, market_ticker, event_ticker, series_ticker,
+                selection_id, selection_group, filter_mode,
+                passes_volume_filter, passes_lifetime_filter, passes_both_filters,
+                volume_fp, lifetime_days, history_start_ts, history_end_ts,
+                expected_daily_rows, received_daily_rows, first_observation_ts,
+                last_observation_ts, status, error_text
+            FROM market_history_manifest
+            WHERE run_id = ?
+            """,
+            (run_id, parent_run_id),
+        )
+
+    def _reset_retry_rows(self, run_id: str, candidates: list[dict[str, Any]]) -> None:
+        self.conn.executemany(
+            """
+            UPDATE market_history_manifest
+            SET received_daily_rows=0,
+                first_observation_ts=NULL,
+                last_observation_ts=NULL,
+                status='queued',
+                error_text=NULL
+            WHERE run_id=? AND market_id=?
+            """,
+            [(run_id, candidate["market_id"]) for candidate in candidates],
         )
 
     def _insert_manifest_rows(self, run_id: str, candidates: list[dict[str, Any]]) -> None:
@@ -342,6 +497,8 @@ class DailyCandleIngestor:
             raise ValueError("filter thresholds must be non-negative")
         if config.period_interval != 1440:
             raise ValueError("This command currently supports daily candles only: period_interval=1440")
+        if config.retry_status is not None and config.retry_status not in RETRY_STATUSES:
+            raise ValueError(f"retry_status must be one of: {', '.join(sorted(RETRY_STATUSES))}")
         if not 1 <= config.max_tickers_per_batch <= 100:
             raise ValueError("max_tickers_per_batch must be between 1 and 100")
         if not 1 <= config.max_candles_per_batch <= 10_000:
@@ -351,7 +508,15 @@ class DailyCandleIngestor:
 
         run_id = _run_id()
         started_at = _now_utc()
-        candidates = self._load_candidates(config)
+        retry_parent_run_id = (
+            self._latest_daily_candle_run_id(config)
+            if config.retry_status is not None
+            else None
+        )
+        candidates = self._load_candidates(
+            config,
+            retry_parent_run_id=retry_parent_run_id,
+        )
         stats: dict[str, Any] = {
             "run_id": run_id,
             "selection_id": config.selection_id,
@@ -369,18 +534,52 @@ class DailyCandleIngestor:
             "api_errors": 0,
             "empty_markets": 0,
             "skipped_no_window": sum(c["expected_daily_rows"] == 0 for c in candidates),
+            "retry_status": config.retry_status,
+            "retry_parent_run_id": retry_parent_run_id,
         }
 
         with self.conn:
-            self._insert_run(run_id, started_at, config)
-            self._insert_manifest_rows(run_id, candidates)
+            self._insert_run(
+                run_id,
+                started_at,
+                config,
+                retry_parent_run_id=retry_parent_run_id,
+            )
+            if retry_parent_run_id is None:
+                self._insert_manifest_rows(run_id, candidates)
+            else:
+                self._copy_manifest_rows(run_id, retry_parent_run_id)
+                self._reset_retry_rows(run_id, candidates)
 
-        batches = self._batches(candidates, config)
-        progress = tqdm(desc="Kalshi daily candle batches", unit="batch", disable=not config.show_progress) if tqdm else None
+        batches = list(self._batches(candidates, config))
+        if config.max_batches is not None:
+            batches = batches[:config.max_batches]
+        status_counts = {
+            "success": 0,
+            "empty": 0,
+            "api_error": 0,
+            "api_error_batches": 0,
+            "skipped_no_window": stats["skipped_no_window"],
+        }
+        stats["status_counts"] = status_counts
+        progress = (
+            tqdm(
+                total=len(batches),
+                desc="Kalshi daily candle batches",
+                unit="batch",
+                disable=not config.show_progress,
+            )
+            if tqdm
+            else None
+        )
+
+        def advance_progress() -> None:
+            if progress is not None:
+                progress.set_postfix(status_counts, refresh=False)
+                progress.update(1)
+
         try:
             for batch_number, batch in enumerate(batches, start=1):
-                if config.max_batches is not None and batch_number > config.max_batches:
-                    break
                 stats["batches"] += 1
                 request_start = min(candidate["history_start_ts"] for candidate in batch)
                 request_end = max(candidate["history_end_ts"] for candidate in batch)
@@ -399,6 +598,8 @@ class DailyCandleIngestor:
                         self._store_batch_payload(run_id, batch_number, payload, retrieved_at)
                 except Exception as exc:  # noqa: BLE001
                     stats["api_errors"] += 1
+                    status_counts["api_error"] += len(batch)
+                    status_counts["api_error_batches"] += 1
                     with self.conn:
                         for candidate in batch:
                             self._update_manifest(
@@ -410,8 +611,7 @@ class DailyCandleIngestor:
                                 "api_error",
                                 repr(exc),
                             )
-                    if progress is not None:
-                        progress.update(1)
+                    advance_progress()
                     continue
 
                 returned_markets = payload.get("markets") if isinstance(payload, dict) else None
@@ -465,6 +665,8 @@ class DailyCandleIngestor:
                             observation_ts.append(end_period_ts)
                             stats["candles_seen"] += 1
                             stats["candles_written"] += 1
+                        market_status = "success" if received else "empty"
+                        status_counts[market_status] += 1
                         if received == 0:
                             stats["empty_markets"] += 1
                         self._update_manifest(
@@ -473,11 +675,12 @@ class DailyCandleIngestor:
                             received,
                             min(observation_ts) if observation_ts else None,
                             max(observation_ts) if observation_ts else None,
-                            "success" if received else "empty",
+                            market_status,
                         )
 
                     for candidate in batch:
                         if candidate["market_ticker"] not in seen_tickers:
+                            status_counts["empty"] += 1
                             stats["empty_markets"] += 1
                             self._update_manifest(
                                 run_id,
@@ -487,8 +690,7 @@ class DailyCandleIngestor:
                                 None,
                                 "empty",
                             )
-                if progress is not None:
-                    progress.update(1)
+                advance_progress()
         except Exception as exc:
             with self.conn:
                 self.conn.execute(

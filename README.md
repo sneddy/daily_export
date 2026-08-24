@@ -29,7 +29,7 @@ The first iteration is intentionally narrow:
 
 - Kalshi only;
 - live API endpoints only;
-- native daily candles with period_interval = 1440;
+- native daily candles with a 1440-minute interval;
 - no raw trade-level download;
 - no historical endpoint;
 - no recurrent high-frequency panels;
@@ -143,33 +143,26 @@ raw_daily_candles
 market_history_manifest
 ~~~
 
-raw_daily_candles is a thin, source-preserving representation of native daily candles. Important fields include:
+raw_daily_candles is a thin, source-preserving representation of native daily candles. The presentation export selects the following research fields:
 
 ~~~text
 market_id
 market_ticker
 series_ticker
 end_period_ts
-period_interval
-source_mode
 price_open
 price_low
 price_high
 price_close
 price_mean
 price_previous
-price_min
-price_max
 yes_bid_*
 yes_ask_*
 volume
 open_interest
-request_start_ts
-request_end_ts
-retrieved_at_utc
-run_id
-raw_payload_json
 ~~~
+
+The complete raw payload and ingestion/provenance fields remain available in SQLite but are not duplicated in the presentation CSV.
 
 market_history_manifest stores the extraction decision and coverage information for each market:
 
@@ -199,15 +192,23 @@ The primary probability used for the first downstream analysis is expected to be
 
 The diagnostic notebook creates a lightweight presentation snapshot under data/demo/:
 
+It also creates a filtered view under data/demo_filtered/ using the intersection of the volume and lifetime filters:
+
 ~~~text
 data/demo/
-├── main_market_manifest.csv
 ├── main_market_metadata.csv
 ├── main_daily_candles.csv.gz
 └── export_summary.json
 ~~~
 
-The market manifest has one row per selected market. The market metadata file is a one-row-per-market lookup keyed by `market_id`; it contains the market question, descriptions, event context, series context, and rules. The daily-candle file contains market-by-day observations needed for the demonstration notebook. The full source payloads remain in SQLite.
+~~~text
+data/demo_filtered/
+├── main_market_metadata.csv
+├── main_daily_candles.csv.gz
+└── export_summary.json
+~~~
+
+The market metadata file is a one-row-per-market lookup keyed by `market_id`; it contains the market question, descriptions, event context, series context, selection filters, lifecycle dates, and candle coverage. The daily-candle file contains market-by-day observations needed for the demonstration notebook. The full source payloads remain in SQLite.
 
 ## Notebook workflow
 
@@ -221,10 +222,10 @@ notebooks/daily_data_diagnostic.ipynb:
 
 - reads SQLite;
 - selects a frozen daily-candle run;
-- extracts the market manifest, market metadata lookup, and daily candles;
+- extracts the combined market metadata and coverage lookup plus daily candles;
 - checks duplicates, intervals, probabilities, missingness, and coverage;
 - preserves the source run status;
-- writes data/demo/ files.
+- writes the full data/demo/ snapshot and the data/demo_filtered/ both-filter view.
 
 This is the only notebook in the demo workflow that uses SQL.
 
@@ -248,8 +249,9 @@ Run the stages in this order:
 2. Build the frozen series manifest.
 3. Download event and market metadata separately for sport, crypto, and main.
 4. Download native daily candles for each group.
-5. Run daily_data_diagnostic.ipynb to create the demo snapshot.
-6. Run daily_data_eda.ipynb for visualization and inspection.
+5. If the daily-candle run is partial, retry unresolved markets with historical `api_error` using `--retry-status api_error`; the command searches the full manifest history for the same selection and group.
+6. Run daily_data_diagnostic.ipynb to create the demo snapshot.
+7. Run daily_data_eda.ipynb for visualization and inspection.
 
 The exact commands and current selection ID are maintained in [COMMANDS.md](COMMANDS.md).
 
@@ -356,3 +358,4 @@ The first iteration is considered operationally complete when:
 - the diagnostic notebook can rebuild the demo CSV snapshot;
 - the EDA notebook can run without SQL or SQLite;
 - the resulting snapshot can support the next outcome-alignment and Brier Score stage.
+

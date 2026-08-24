@@ -1,0 +1,13 @@
+{
+  "source_data_dir": "daily_export/data/demo",
+  "selection_rule": "resolved binary markets sorted by volume_fp descending",
+  "requested_market_count": 50,
+  "market_count": 50,
+  "candle_row_count": 8823,
+  "market_result_counts": {
+    "no": 34,
+    "yes": 16
+  },
+  "first_observation_utc": "2025-01-17T00:00:00+00:00",
+  "last_observation_utc": "2026-08-18T00:00:00+00:00"
+}

@@ -7,7 +7,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sqlite3
 
-from kalshi_daily_research.candles import DailyCandleIngestor, DailyCandleRunConfig, FILTER_MODES
+from kalshi_daily_research.candles import (
+    DailyCandleIngestor,
+    DailyCandleRunConfig,
+    FILTER_MODES,
+    RETRY_STATUSES,
+)
 from kalshi_daily_research.client import KalshiMetadataClient
 from kalshi_daily_research.series_manifest import MANIFEST_GROUPS
 
@@ -69,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Request Kalshi's synthetic continuity candle before the start; disabled by default.",
     )
+    parser.add_argument(
+        "--retry-status",
+        choices=sorted(RETRY_STATUSES),
+        default=None,
+        help=(
+            "Retry unresolved markets with this historical status from the database for the "
+            "same selection and group; batch size is controlled by --max-tickers-per-batch."
+        ),
+    )
     parser.add_argument("--no-progress", action="store_true", help="Disable the batch progress bar.")
     return parser
 
@@ -104,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         max_candles_per_batch=args.max_candles_per_batch,
         max_batches=args.max_batches,
         include_latest_before_start=args.include_latest_before_start,
+        retry_status=args.retry_status,
         show_progress=not args.no_progress,
     )
     with sqlite3.connect(args.db_path) as conn:

@@ -1,6 +1,7 @@
 /db/
 /logs/
 /data/demo/main_daily_candles.csv
+/data/demo_filtered/main_daily_candles.csv
 *.db
 *.sqlite
 *.sqlite3
