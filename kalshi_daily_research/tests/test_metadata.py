@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import pytest
+
 from kalshi_daily_research.ingest import RawMetadataIngestor, RawMetadataRunConfig, RawSeriesRunConfig
 from kalshi_daily_research.schema import ensure_schema
+from kalshi_daily_research.scripts.download_group import _resolve_historical_cutoff
 
 
 class FakeClient:
@@ -164,3 +167,26 @@ def test_series_only_ingestion_does_not_download_events_or_markets() -> None:
     assert conn.execute("SELECT COUNT(*) FROM raw_markets").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM raw_payloads WHERE entity_type='event'").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM raw_payloads WHERE entity_type='market'").fetchone()[0] == 0
+
+
+class CutoffClient:
+    def get_historical_cutoff(self):
+        return {"market_settled_ts": "2025-01-01T00:00:00Z"}
+
+
+def test_historical_cutoff_rejects_a_window_that_crosses_into_live_data() -> None:
+    cutoff = _resolve_historical_cutoff(
+        CutoffClient(),
+        completed_from_ts=1577836800,
+        completed_to_ts=1735689600,
+        source_mode="historical",
+    )
+    assert cutoff == "2025-01-01T00:00:00Z"
+
+    with pytest.raises(ValueError, match="crosses the live/historical cutoff"):
+        _resolve_historical_cutoff(
+            CutoffClient(),
+            completed_from_ts=1577836800,
+            completed_to_ts=1735689601,
+            source_mode="historical",
+        )

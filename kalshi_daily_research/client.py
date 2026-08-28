@@ -118,6 +118,12 @@ class KalshiMetadataClient:
         )
         return payload if isinstance(payload, dict) else {}
 
+    def get_historical_cutoff(self) -> dict[str, Any]:
+        """Return the current live/historical partition timestamps."""
+
+        payload = self._get_json("historical/cutoff", params={})
+        return payload if isinstance(payload, dict) else {}
+
     def get_market_candlesticks(
         self,
         *,

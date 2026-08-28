@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 
 from kalshi_daily_research.client import KalshiMetadataClient
-from kalshi_daily_research.ingest import ManifestGroupRunConfig, RawMetadataIngestor
+from kalshi_daily_research.ingest import ManifestGroupRunConfig, RawMetadataIngestor, _unix_timestamp
 from kalshi_daily_research.series_manifest import MANIFEST_GROUPS
 
 
@@ -69,10 +69,38 @@ def _resolve_completion_window(args: argparse.Namespace) -> tuple[int | None, in
     return start_ts, end_ts
 
 
+def _resolve_historical_cutoff(
+    client: KalshiMetadataClient,
+    *,
+    completed_from_ts: int | None,
+    completed_to_ts: int | None,
+    source_mode: str,
+) -> str | None:
+    if source_mode not in {"historical", "both"}:
+        return None
+    cutoff = client.get_historical_cutoff()
+    cutoff_utc = cutoff.get("market_settled_ts")
+    cutoff_ts = _unix_timestamp(cutoff_utc)
+    if cutoff_ts is None:
+        raise ValueError("Historical cutoff response did not contain market_settled_ts")
+    if source_mode == "historical" and completed_to_ts is not None and completed_to_ts > cutoff_ts:
+        raise ValueError(
+            "The requested settlement window crosses the live/historical cutoff "
+            f"({cutoff_utc}). Split the window or use the appropriate source mode."
+        )
+    return str(cutoff_utc)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     completed_from_ts, completed_to_ts = _resolve_completion_window(args)
     client = KalshiMetadataClient(base_url=args.base_url)
+    historical_cutoff_utc = _resolve_historical_cutoff(
+        client,
+        completed_from_ts=completed_from_ts,
+        completed_to_ts=completed_to_ts,
+        source_mode=args.source_mode,
+    )
     with sqlite3.connect(args.db_path) as conn:
         result = RawMetadataIngestor(conn, client).run_manifest_group(
             ManifestGroupRunConfig(
@@ -86,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
                 show_progress=not args.no_progress,
                 completed_from_ts=completed_from_ts,
                 completed_to_ts=completed_to_ts,
+                historical_cutoff_utc=historical_cutoff_utc,
             )
         )
     print(result)
@@ -94,4 +123,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

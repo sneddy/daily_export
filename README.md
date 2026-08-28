@@ -2,7 +2,7 @@
 
 This project builds a reproducible daily-resolution dataset for research on Kalshi prediction markets.
 
-Operational commands and decisions are recorded in [COMMANDS.md](COMMANDS.md).
+Operational commands and decisions are recorded in [COMMANDS.md](COMMANDS.md). The separate 2020–2024 historical workflow is documented in [historical_commands.md](historical_commands.md).
 
 ## Purpose
 
@@ -10,7 +10,7 @@ Build a reproducible daily dataset that can support the following research quest
 
 > How informative and well-calibrated are prediction-market probabilities across different topics and levels of market activity?
 
-The first platform is Kalshi. The first implementation uses native daily candles obtained through the live API endpoints. It does not require downloading all individual trades or constructing minute-level panels.
+The first live implementation uses native daily candles obtained through Kalshi's live API endpoints. The separate historical extension uses Kalshi's historical endpoints; neither workflow requires downloading all individual trades or constructing minute-level panels.
 
 The intended research outputs are:
 
@@ -21,17 +21,17 @@ The intended research outputs are:
 - results by topic, volume, liquidity, and time to resolution;
 - confidence intervals and complete sample and coverage diagnostics.
 
-The current repository contains the data-extraction and daily-data demonstration layers. Outcome alignment and forecast evaluation are downstream research layers that are not yet finalized.
+This repository is dedicated to data extraction and daily-data demonstration. Outcome alignment and forecast evaluation live in the separate [context research layer](../context_research/README.md).
 
 ## Current first iteration
 
 The first iteration is intentionally narrow:
 
 - Kalshi only;
-- live API endpoints only;
+- live API endpoints only for the current first iteration;
 - native daily candles with a 1440-minute interval;
 - no raw trade-level download;
-- no historical endpoint;
+- historical 2020–2024 extraction is maintained as a separate stream in `historical_commands.md`;
 - no recurrent high-frequency panels;
 - three research groups:
   - sport;
@@ -89,7 +89,7 @@ flowchart LR
     F --> G[Market-level filters]
     G --> H[Native daily candles]
     H --> I[(Raw SQLite database)]
-    I --> J[Diagnostic export]
+    I --> J[CLI snapshot export]
     J --> K[CSV demo snapshot]
     K --> L[CSV-only EDA notebook]
     L --> M[Future outcome and calibration research]
@@ -190,21 +190,21 @@ The primary probability used for the first downstream analysis is expected to be
 
 ### 4. Prepared demo snapshot
 
-The diagnostic notebook creates a lightweight presentation snapshot under data/demo/:
+The `export_daily_snapshot` script creates a lightweight presentation snapshot under data/demo/:
 
 It also creates a filtered view under data/demo_filtered/ using the intersection of the volume and lifetime filters:
 
 ~~~text
 data/demo/
 ├── main_market_metadata.csv
-├── main_daily_candles.csv.gz
+├── main_daily_candles.csv
 └── export_summary.json
 ~~~
 
 ~~~text
 data/demo_filtered/
 ├── main_market_metadata.csv
-├── main_daily_candles.csv.gz
+├── main_daily_candles.csv
 └── export_summary.json
 ~~~
 
@@ -212,9 +212,20 @@ The market metadata file is a one-row-per-market lookup keyed by `market_id`; it
 
 ## Notebook workflow
 
-The notebooks are intentionally separated into preparation and presentation layers.
+The export script and notebooks are intentionally separated into materialization, diagnosis, and presentation layers.
 
 The purpose, execution order, and current key insights for every notebook are documented in [notebooks/README.md](notebooks/README.md).
+
+### Snapshot export script
+
+`kalshi_daily_research.scripts.export_daily_snapshot`:
+
+- reads SQLite in read-only mode;
+- selects the latest matching daily-candle run or an explicit run ID;
+- includes the parent chain for retry runs;
+- writes the full CSV/JSON snapshot and the both-filter view.
+
+Use [COMMANDS.md](COMMANDS.md) for live commands and [historical_commands.md](historical_commands.md) for historical commands.
 
 ### Diagnostic notebook
 
@@ -225,9 +236,9 @@ notebooks/daily_data_diagnostic.ipynb:
 - extracts the combined market metadata and coverage lookup plus daily candles;
 - checks duplicates, intervals, probabilities, missingness, and coverage;
 - preserves the source run status;
-- writes the full data/demo/ snapshot and the data/demo_filtered/ both-filter view.
+- can inspect and, when run interactively, rebuild the full data/demo/ snapshot and the data/demo_filtered/ both-filter view.
 
-This is the only notebook in the demo workflow that uses SQL.
+This is the only notebook in the demo workflow that uses SQL, but it is not required for standard export generation.
 
 ### EDA demonstration notebook
 
@@ -250,8 +261,9 @@ Run the stages in this order:
 3. Download event and market metadata separately for sport, crypto, and main.
 4. Download native daily candles for each group.
 5. If the daily-candle run is partial, retry unresolved markets with historical `api_error` using `--retry-status api_error`; the command searches the full manifest history for the same selection and group.
-6. Run daily_data_diagnostic.ipynb to create the demo snapshot.
-7. Run daily_data_eda.ipynb for visualization and inspection.
+6. Run `export_daily_snapshot` to create the demo snapshot.
+7. Optionally run `daily_data_diagnostic.ipynb` for interactive SQL checks.
+8. Run `daily_data_eda.ipynb` for visualization and inspection.
 
 The exact commands and current selection ID are maintained in [COMMANDS.md](COMMANDS.md).
 
@@ -331,12 +343,14 @@ daily_export/
 │   ├── series_selection.py
 │   ├── series_manifest.py
 │   ├── scripts/
+│   │   └── export_daily_snapshot.py
 │   └── tests/
 ├── manifests/
 ├── notebooks/
 │   ├── analyze_metadata.ipynb
 │   ├── daily_data_diagnostic.ipynb
 │   ├── daily_data_eda.ipynb
+│   ├── daily_data_eda_historical.ipynb
 │   └── explore_series.ipynb
 ├── data/
 │   └── demo/
@@ -355,7 +369,6 @@ The first iteration is considered operationally complete when:
 - native daily candles are stored with source provenance;
 - market-level volume and lifetime decisions are recorded;
 - partial retrieval and coverage diagnostics are visible;
-- the diagnostic notebook can rebuild the demo CSV snapshot;
+- the export script can rebuild the demo CSV snapshot;
 - the EDA notebook can run without SQL or SQLite;
 - the resulting snapshot can support the next outcome-alignment and Brier Score stage.
-

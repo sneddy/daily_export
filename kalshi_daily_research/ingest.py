@@ -62,6 +62,7 @@ class ManifestGroupRunConfig:
     show_progress: bool = True
     completed_from_ts: int | None = None
     completed_to_ts: int | None = None
+    historical_cutoff_utc: str | None = None
 
 
 def _now_utc() -> str:
@@ -592,6 +593,7 @@ class RawMetadataIngestor:
             "series_run_id": selection[1],
             "selection_rule_sha256": selection[2],
             "selection_membership_sha256": selection[3],
+            "historical_cutoff_utc": config.historical_cutoff_utc,
             "config": asdict(config),
         }
         with self.conn:

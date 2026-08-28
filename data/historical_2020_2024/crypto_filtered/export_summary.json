@@ -1,0 +1,94 @@
+{
+  "export_created_at_utc": "2026-08-28T17:51:56.773770+00:00",
+  "selection_id": "20260817T124811Z-3b15c8a0-637b555156e3",
+  "selection_group": "crypto",
+  "source_mode": "historical",
+  "filter_mode": "both",
+  "min_volume_fp": 10000.0,
+  "min_lifetime_days": 5.0,
+  "api_base_url": "https://api.elections.kalshi.com/trade-api/v2/",
+  "metadata_run_id": "20260828T073127Z-32e0ccae",
+  "metadata_run_status": "success",
+  "candle_endpoint": "/historical/markets/{ticker}/candlesticks",
+  "settlement_window_utc": {
+    "from": "2020-01-01T00:00:00Z",
+    "to": "2025-01-01T00:00:00Z"
+  },
+  "historical_cutoff_utc": "2026-06-29T00:00:00Z",
+  "candle_run_id": "20260828T143016Z-28aed83d",
+  "retry_parent_run_id": null,
+  "run_status": "success",
+  "run_started_at_utc": "2026-08-28T14:30:16Z",
+  "run_finished_at_utc": "2026-08-28T14:30:31Z",
+  "market_metadata_rows": 22,
+  "candle_rows": 2346,
+  "markets_with_candles": 22,
+  "first_candle_date_utc": "2024-03-19T00:00:00+00:00",
+  "last_candle_date_utc": "2024-12-20T00:00:00+00:00",
+  "filter_counts": [
+    {
+      "passes_volume_filter": 1,
+      "passes_lifetime_filter": 1,
+      "passes_both_filters": 1,
+      "markets": 22
+    }
+  ],
+  "quality": {
+    "metadata_market_id_unique": true,
+    "candle_market_day_unique": true,
+    "duplicate_market_day_rows": 0,
+    "candle_markets_missing_metadata": 0
+  },
+  "run_stats": {
+    "api_errors": 0,
+    "batches": 68,
+    "both_filter_markets": 22,
+    "candidate_markets": 68,
+    "candles_seen": 3023,
+    "candles_written": 3023,
+    "empty_markets": 0,
+    "filter_mode": "union",
+    "invalid_records": 0,
+    "lifetime_filter_markets": 67,
+    "markets_returned": 68,
+    "max_workers": 4,
+    "requests": 68,
+    "retry_parent_run_id": null,
+    "retry_status": null,
+    "run_id": "20260828T143016Z-28aed83d",
+    "selection_group": "crypto",
+    "selection_id": "20260817T124811Z-3b15c8a0-637b555156e3",
+    "skipped_no_window": 0,
+    "source_mode": "historical",
+    "status_counts": {
+      "api_error": 0,
+      "api_error_batches": 0,
+      "empty": 0,
+      "skipped_no_window": 0,
+      "success": 68
+    },
+    "volume_filter_markets": 23
+  },
+  "source_export": "/Users/sneddy/research/pred_markets_clean/daily_export/data/historical_2020_2024/crypto",
+  "source_filter_counts": [
+    {
+      "passes_volume_filter": 0,
+      "passes_lifetime_filter": 1,
+      "passes_both_filters": 0,
+      "markets": 45
+    },
+    {
+      "passes_volume_filter": 1,
+      "passes_lifetime_filter": 0,
+      "passes_both_filters": 0,
+      "markets": 1
+    },
+    {
+      "passes_volume_filter": 1,
+      "passes_lifetime_filter": 1,
+      "passes_both_filters": 1,
+      "markets": 22
+    }
+  ],
+  "filter_definition": "passes_both_filters == 1"
+}

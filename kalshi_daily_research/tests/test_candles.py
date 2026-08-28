@@ -53,6 +53,32 @@ class FailingCandleClient(FakeCandleClient):
         raise RuntimeError("HTTPError('400 Client Error: Bad Request')")
 
 
+class FakeHistoricalCandleClient(FakeCandleClient):
+    def get_historical_market_candlesticks(self, **params):
+        self.calls.append(params)
+        ticker = params["market_ticker"]
+        return {
+            "ticker": ticker,
+            "candlesticks": [
+                {
+                    "end_period_ts": 1_785_888_000,
+                    "price": {
+                        "open": "0.40",
+                        "low": "0.30",
+                        "high": "0.50",
+                        "close": "0.45",
+                        "mean": "0.41",
+                        "previous": "0.39",
+                    },
+                    "yes_bid": {"open": "0.30", "low": "0.30", "high": "0.30", "close": "0.30"},
+                    "yes_ask": {"open": "0.50", "low": "0.50", "high": "0.50", "close": "0.50"},
+                    "volume": "12.00",
+                    "open_interest": "8.00",
+                }
+            ],
+        }
+
+
 def _seed_database(conn: sqlite3.Connection) -> None:
     ensure_schema(conn)
     conn.executemany(
@@ -163,6 +189,67 @@ def test_both_filter_mode_downloads_only_intersection() -> None:
 
     assert result["candidate_markets"] == 1
     assert client.calls[0]["market_tickers"] == ["MARKET-BOTH"]
+
+
+def test_historical_mode_uses_single_market_legacy_payload_and_source_provenance() -> None:
+    conn = sqlite3.connect(":memory:")
+    _seed_database(conn)
+    conn.execute(
+        """
+        INSERT INTO metadata_runs
+            (run_id, started_at_utc, status, base_url, source_mode, config_json)
+        VALUES ('historical-metadata-run', '2026-08-20T01:00:00Z', 'success',
+                'https://example.test', 'historical', '{}')
+        """
+    )
+    conn.execute(
+        "UPDATE raw_markets SET run_id='historical-metadata-run'"
+    )
+    client = FakeHistoricalCandleClient()
+
+    result = DailyCandleIngestor(conn, client).run(
+        DailyCandleRunConfig(
+            selection_id=SELECTION_ID,
+            selection_group="non_sport_crypto",
+            source_mode="historical",
+            filter_mode="union",
+            max_markets=2,
+            max_workers=2,
+            show_progress=False,
+        )
+    )
+
+    assert result["candidate_markets"] == 2
+    assert result["requests"] == 2
+    assert result["candles_written"] == 2
+    assert {call["market_ticker"] for call in client.calls} == {
+        "MARKET-BOTH",
+        "MARKET-LIFETIME",
+    }
+    candle = conn.execute(
+        """
+        SELECT source_mode, source_endpoint, price_mean, volume, open_interest
+        FROM raw_daily_candles
+        ORDER BY market_ticker
+        LIMIT 1
+        """
+    ).fetchone()
+    assert candle == (
+        "historical",
+        "/historical/markets/MARKET-BOTH/candlesticks",
+        0.41,
+        12.0,
+        8.0,
+    )
+    run_source = conn.execute(
+        "SELECT source_mode FROM metadata_runs WHERE run_id=?",
+        (result["run_id"],),
+    ).fetchone()[0]
+    assert run_source == "historical"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM raw_payloads WHERE run_id=? AND entity_type='daily_candles'",
+        (result["run_id"],),
+    ).fetchone()[0] == 2
 
 
 def test_retry_status_uses_latest_run_and_isolates_tickers() -> None:

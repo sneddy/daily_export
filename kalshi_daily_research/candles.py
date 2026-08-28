@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
 import math
 import sqlite3
+import threading
 from typing import Any, Iterable
 import uuid
 
@@ -23,6 +25,7 @@ from .schema import ensure_schema
 
 FILTER_MODES = frozenset({"volume", "lifetime", "both", "union"})
 RETRY_STATUSES = frozenset({"api_error"})
+SOURCE_MODES = frozenset({"live", "historical"})
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,9 @@ class DailyCandleRunConfig:
     include_latest_before_start: bool = False
     retry_status: str | None = None
     show_progress: bool = True
+    source_mode: str = "live"
+    max_markets: int | None = None
+    max_workers: int = 4
 
 
 def _run_id() -> str:
@@ -134,10 +140,11 @@ class DailyCandleIngestor:
             WHERE json_extract(config_json, '$.stage') = 'daily_candles'
               AND json_extract(config_json, '$.selection_id') = ?
               AND json_extract(config_json, '$.selection_group') = ?
+              AND source_mode = ?
             ORDER BY started_at_utc DESC, rowid DESC
             LIMIT 1
             """,
-            (config.selection_id, config.selection_group),
+            (config.selection_id, config.selection_group, config.source_mode),
         ).fetchone()
         if row is None:
             raise ValueError(
@@ -164,6 +171,7 @@ class DailyCandleIngestor:
                 JOIN metadata_runs mr ON mr.run_id = mh.run_id
                 WHERE mh.selection_id = ?
                   AND mh.selection_group = ?
+                  AND mr.source_mode = ?
             )
             SELECT
                 market_id,
@@ -190,6 +198,7 @@ class DailyCandleIngestor:
             (
                 config.selection_id,
                 config.selection_group,
+                config.source_mode,
             ),
         ).fetchall()
 
@@ -250,7 +259,9 @@ class DailyCandleIngestor:
               ON sm.series_ticker = COALESCE(m.series_ticker, e.series_ticker)
              AND sm.selection_id = ?
              AND sm.eligible = 1
-            LEFT JOIN metadata_runs r ON r.run_id = m.run_id
+            JOIN metadata_runs r
+              ON r.run_id = m.run_id
+             AND r.source_mode = ?
             WHERE COALESCE(sm.selection_group, json_extract(r.config_json, '$.selection_group')) = ?
               AND (
                     sm.series_ticker IS NOT NULL
@@ -259,7 +270,7 @@ class DailyCandleIngestor:
               AND m.ticker IS NOT NULL
             ORDER BY m.ticker
             """,
-            (config.selection_id, config.selection_group, config.selection_id),
+            (config.selection_id, config.source_mode, config.selection_group, config.selection_id),
         ).fetchall()
 
         now_ts = int(datetime.now(tz=UTC).timestamp())
@@ -363,9 +374,15 @@ class DailyCandleIngestor:
             """
             INSERT INTO metadata_runs
                 (run_id, started_at_utc, status, base_url, source_mode, config_json)
-            VALUES (?, ?, 'running', ?, 'live', ?)
+            VALUES (?, ?, 'running', ?, ?, ?)
             """,
-            (run_id, started_at, getattr(self.client, "base_url", ""), _json_text(run_config)),
+            (
+                run_id,
+                started_at,
+                getattr(self.client, "base_url", ""),
+                config.source_mode,
+                _json_text(run_config),
+            ),
         )
 
     def _copy_manifest_rows(self, run_id: str, parent_run_id: str) -> None:
@@ -490,7 +507,257 @@ class DailyCandleIngestor:
             (received, first_ts, last_ts, status, error_text, run_id, ticker),
         )
 
+    def _process_market_payload(
+        self,
+        *,
+        run_id: str,
+        candidate: dict[str, Any],
+        payload: dict[str, Any],
+        request_start_ts: int,
+        request_end_ts: int,
+        retrieved_at: str,
+        config: DailyCandleRunConfig,
+    ) -> tuple[str, int, int]:
+        """Normalize one market payload and update its manifest row."""
+
+        ticker = payload.get("market_ticker") or payload.get("ticker")
+        if not ticker or ticker != candidate["market_ticker"]:
+            self._update_manifest(
+                run_id,
+                candidate["market_ticker"],
+                0,
+                None,
+                None,
+                "empty",
+                "historical payload ticker did not match the requested market",
+            )
+            return "empty", 0, 1
+
+        candles = payload.get("candlesticks")
+        if not isinstance(candles, list):
+            candles = []
+        received = 0
+        invalid_records = 0
+        observation_ts: list[int] = []
+        for candle in candles:
+            if not isinstance(candle, dict):
+                invalid_records += 1
+                continue
+            end_period_ts = _unix_timestamp(candle.get("end_period_ts"))
+            if end_period_ts is None or not (
+                candidate["history_start_ts"] <= end_period_ts <= candidate["history_end_ts"]
+            ):
+                continue
+            normalized = _normalize_candle(
+                candle,
+                market_id=candidate["market_id"],
+                market_ticker=ticker,
+                series_ticker=candidate["series_ticker"],
+                source_mode=config.source_mode,
+                source_endpoint=(
+                    "/markets/candlesticks"
+                    if config.source_mode == "live"
+                    else f"/historical/markets/{candidate['market_ticker']}/candlesticks"
+                ),
+                request_start_ts=request_start_ts,
+                request_end_ts=request_end_ts,
+                retrieved_at=retrieved_at,
+                run_id=run_id,
+                period_interval=config.period_interval,
+            )
+            if normalized is None:
+                invalid_records += 1
+                continue
+            self._upsert_candle(normalized)
+            received += 1
+            observation_ts.append(end_period_ts)
+
+        status = "success" if received else "empty"
+        self._update_manifest(
+            run_id,
+            ticker,
+            received,
+            min(observation_ts) if observation_ts else None,
+            max(observation_ts) if observation_ts else None,
+            status,
+        )
+        return status, received, invalid_records
+
+    def _store_single_payload(
+        self,
+        run_id: str,
+        market_ticker: str,
+        payload: dict[str, Any],
+        retrieved_at: str,
+        source_endpoint: str,
+    ) -> None:
+        payload_json = _json_text(payload)
+        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        self.conn.execute(
+            """
+            INSERT INTO raw_payloads (
+                run_id, entity_type, entity_key, source_endpoint,
+                retrieved_at_utc, payload_sha256, payload_json
+            ) VALUES (?, 'daily_candles', ?, ?, ?, ?, ?)
+            """,
+            (run_id, market_ticker, source_endpoint, retrieved_at, payload_hash, payload_json),
+        )
+
+    def _run_historical_requests(
+        self,
+        *,
+        run_id: str,
+        candidates: list[dict[str, Any]],
+        config: DailyCandleRunConfig,
+        stats: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Fetch archived market candles through the single-market endpoint."""
+
+        queued_candidates = [candidate for candidate in candidates if candidate["expected_daily_rows"] > 0]
+        status_counts = {
+            "success": 0,
+            "empty": 0,
+            "api_error": 0,
+            "api_error_batches": 0,
+            "skipped_no_window": stats["skipped_no_window"],
+        }
+        stats["status_counts"] = status_counts
+        stats["requests"] = 0
+        stats["max_workers"] = config.max_workers
+        progress = (
+            tqdm(
+                total=len(queued_candidates),
+                desc="Kalshi historical daily candles",
+                unit="market",
+                disable=not config.show_progress,
+            )
+            if tqdm
+            else None
+        )
+        thread_local = threading.local()
+
+        def fetch(candidate: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None, str | None, str]:
+            client = getattr(thread_local, "client", None)
+            if client is None:
+                if isinstance(self.client, KalshiMetadataClient):
+                    client = KalshiMetadataClient(
+                        base_url=self.client.base_url,
+                        config=self.client.config,
+                    )
+                else:
+                    client = self.client
+                thread_local.client = client
+            retrieved_at = _now_utc()
+            try:
+                payload = client.get_historical_market_candlesticks(
+                    market_ticker=candidate["market_ticker"],
+                    start_ts=candidate["history_start_ts"],
+                    end_ts=candidate["history_end_ts"],
+                    period_interval=config.period_interval,
+                )
+                return candidate, payload, None, retrieved_at
+            except Exception as exc:  # noqa: BLE001
+                return candidate, None, repr(exc), retrieved_at
+
+        def consume(result: tuple[dict[str, Any], dict[str, Any] | None, str | None, str]) -> None:
+            candidate, payload, error_text, retrieved_at = result
+            stats["requests"] += 1
+            stats["batches"] += 1
+            if error_text is not None:
+                stats["api_errors"] += 1
+                status_counts["api_error"] += 1
+                status_counts["api_error_batches"] += 1
+                with self.conn:
+                    self._update_manifest(
+                        run_id,
+                        candidate["market_ticker"],
+                        0,
+                        None,
+                        None,
+                        "api_error",
+                        error_text,
+                    )
+            elif not isinstance(payload, dict):
+                stats["invalid_records"] += 1
+                status_counts["empty"] += 1
+                stats["empty_markets"] += 1
+                with self.conn:
+                    self._update_manifest(
+                        run_id,
+                        candidate["market_ticker"],
+                        0,
+                        None,
+                        None,
+                        "empty",
+                    )
+            else:
+                stats["markets_returned"] += 1
+                with self.conn:
+                    self._store_single_payload(
+                        run_id,
+                        candidate["market_ticker"],
+                        payload,
+                        retrieved_at,
+                        f"/historical/markets/{candidate['market_ticker']}/candlesticks",
+                    )
+                    status, received, invalid_records = self._process_market_payload(
+                        run_id=run_id,
+                        candidate=candidate,
+                        payload=payload,
+                        request_start_ts=candidate["history_start_ts"],
+                        request_end_ts=candidate["history_end_ts"],
+                        retrieved_at=retrieved_at,
+                        config=config,
+                    )
+                status_counts[status] += 1
+                stats["invalid_records"] += invalid_records
+                stats["candles_seen"] += received
+                stats["candles_written"] += received
+                if status == "empty":
+                    stats["empty_markets"] += 1
+            if progress is not None:
+                progress.set_postfix(status_counts, refresh=False)
+                progress.update(1)
+
+        try:
+            with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+                candidate_iter = iter(queued_candidates)
+                pending = {
+                    executor.submit(fetch, next(candidate_iter)): True
+                    for _ in range(min(len(queued_candidates), config.max_workers * 4))
+                }
+                while pending:
+                    completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        pending.pop(future)
+                        consume(future.result())
+                        try:
+                            next_candidate = next(candidate_iter)
+                        except StopIteration:
+                            continue
+                        pending[executor.submit(fetch, next_candidate)] = True
+        except KeyboardInterrupt:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE metadata_runs SET finished_at_utc=?, status='partial', stats_json=? WHERE run_id=?",
+                    (_now_utc(), _json_text(stats), run_id),
+                )
+            raise
+        finally:
+            if progress is not None:
+                progress.close()
+
+        final_status = "success" if stats["api_errors"] == 0 else "partial"
+        with self.conn:
+            self.conn.execute(
+                "UPDATE metadata_runs SET finished_at_utc=?, status=?, stats_json=? WHERE run_id=?",
+                (_now_utc(), final_status, _json_text(stats), run_id),
+            )
+        return stats
+
     def run(self, config: DailyCandleRunConfig) -> dict[str, Any]:
+        if config.source_mode not in SOURCE_MODES:
+            raise ValueError(f"source_mode must be one of: {', '.join(sorted(SOURCE_MODES))}")
         if config.filter_mode not in FILTER_MODES:
             raise ValueError(f"filter_mode must be one of: {', '.join(sorted(FILTER_MODES))}")
         if config.min_volume_fp < 0 or config.min_lifetime_days < 0:
@@ -503,6 +770,14 @@ class DailyCandleIngestor:
             raise ValueError("max_tickers_per_batch must be between 1 and 100")
         if not 1 <= config.max_candles_per_batch <= 10_000:
             raise ValueError("max_candles_per_batch must be between 1 and 10000")
+        if config.max_markets is not None and config.max_markets < 1:
+            raise ValueError("max_markets must be positive")
+        if not 1 <= config.max_workers <= 32:
+            raise ValueError("max_workers must be between 1 and 32")
+        if config.source_mode == "historical" and config.include_latest_before_start:
+            raise ValueError("include_latest_before_start is supported only for live candles")
+        if config.source_mode == "historical" and config.max_batches is not None:
+            raise ValueError("max_batches is supported only for live candles; use max_markets for historical smoke tests")
         if config.start_ts is not None and config.end_ts is not None and config.end_ts <= config.start_ts:
             raise ValueError("end_ts must be after start_ts")
 
@@ -517,10 +792,13 @@ class DailyCandleIngestor:
             config,
             retry_parent_run_id=retry_parent_run_id,
         )
+        if config.max_markets is not None:
+            candidates = candidates[: config.max_markets]
         stats: dict[str, Any] = {
             "run_id": run_id,
             "selection_id": config.selection_id,
             "selection_group": config.selection_group,
+            "source_mode": config.source_mode,
             "filter_mode": config.filter_mode,
             "candidate_markets": len(candidates),
             "volume_filter_markets": sum(c["passes_volume_filter"] for c in candidates),
@@ -550,6 +828,14 @@ class DailyCandleIngestor:
             else:
                 self._copy_manifest_rows(run_id, retry_parent_run_id)
                 self._reset_retry_rows(run_id, candidates)
+
+        if config.source_mode == "historical":
+            return self._run_historical_requests(
+                run_id=run_id,
+                candidates=candidates,
+                config=config,
+                stats=stats,
+            )
 
         batches = list(self._batches(candidates, config))
         if config.max_batches is not None:
@@ -649,7 +935,7 @@ class DailyCandleIngestor:
                                 market_id=candidate["market_id"],
                                 market_ticker=ticker,
                                 series_ticker=candidate["series_ticker"],
-                                source_mode="live",
+                                source_mode=config.source_mode,
                                 source_endpoint="/markets/candlesticks",
                                 request_start_ts=request_start,
                                 request_end_ts=request_end,

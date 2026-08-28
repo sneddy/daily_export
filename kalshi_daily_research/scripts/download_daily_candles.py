@@ -12,6 +12,7 @@ from kalshi_daily_research.candles import (
     DailyCandleRunConfig,
     FILTER_MODES,
     RETRY_STATUSES,
+    SOURCE_MODES,
 )
 from kalshi_daily_research.client import KalshiMetadataClient
 from kalshi_daily_research.series_manifest import MANIFEST_GROUPS
@@ -35,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=MANIFEST_GROUPS,
         default="non_sport_crypto",
         help="Frozen manifest group; default: non_sport_crypto.",
+    )
+    parser.add_argument(
+        "--source-mode",
+        choices=sorted(SOURCE_MODES),
+        default="live",
+        help="Candle source tier: live batch endpoint or historical single-market endpoint; default: live.",
     )
     parser.add_argument(
         "--filter-mode",
@@ -70,6 +77,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-batches", type=int, default=None, help="Optional batch cap for smoke runs.")
     parser.add_argument(
+        "--max-markets",
+        type=int,
+        default=None,
+        help="Optional market cap for smoke runs; applied before requests in either source mode.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Historical request concurrency; default: 4.",
+    )
+    parser.add_argument(
         "--include-latest-before-start",
         action="store_true",
         help="Request Kalshi's synthetic continuity candle before the start; disabled by default.",
@@ -80,10 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Retry unresolved markets with this historical status from the database for the "
-            "same selection and group; batch size is controlled by --max-tickers-per-batch."
+            "same selection, group, and source mode. Live request size uses --max-tickers-per-batch; "
+            "historical concurrency uses --max-workers."
         ),
     )
-    parser.add_argument("--no-progress", action="store_true", help="Disable the batch progress bar.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable the progress bar.")
     return parser
 
 
@@ -109,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     config = DailyCandleRunConfig(
         selection_id=args.selection_id,
         selection_group=args.group,
+        source_mode=args.source_mode,
         filter_mode=args.filter_mode,
         min_volume_fp=args.min_volume_fp,
         min_lifetime_days=args.min_lifetime_days,
@@ -117,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
         max_tickers_per_batch=args.max_tickers_per_batch,
         max_candles_per_batch=args.max_candles_per_batch,
         max_batches=args.max_batches,
+        max_markets=args.max_markets,
+        max_workers=args.max_workers,
         include_latest_before_start=args.include_latest_before_start,
         retry_status=args.retry_status,
         show_progress=not args.no_progress,
